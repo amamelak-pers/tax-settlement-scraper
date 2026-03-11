@@ -1,13 +1,15 @@
 """
 Tax Resolution Business Listing Scraper
-- Active listings only (no Sold/Completed)
-- Cleaner sheet schema with broker contact field
-- Strict URL requirement in every listing
-- Tier-1 rate limit safe: short prompts + 70s pauses
+- Uses claude-haiku-4-5 (50K token/min Tier 1 limit vs 30K for Sonnet)
+- 90s pauses between batches
+- Debug logging to see raw Claude output
+- Loose JSON parsing with fallback
+- Active/Under LOI only
 """
 
 import os
 import json
+import re
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
@@ -20,79 +22,77 @@ GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SHEET_NAME        = "Listings"
 
-# JSON schema instruction — kept short for token efficiency
-# url is REQUIRED — Claude must always include the direct listing URL
 J = (
-    'Return ONLY a JSON array, no other text. '
-    'ONLY include listings with status "Active" or "Under LOI" — exclude Sold/Completed. '
-    'url field is REQUIRED — always include the direct URL to the listing page, never leave blank. '
+    'Return ONLY a JSON array. No explanation, no markdown. '
+    'Only include listings with status Active or Under LOI — skip Sold/Completed. '
+    'Always include the direct URL to the listing. '
     'Schema: [{'
-    '"listing_title":"full title of listing",'
-    '"platform":"site or broker name",'
-    '"url":"REQUIRED direct URL to listing",'
+    '"listing_title":"title",'
+    '"platform":"site or broker",'
+    '"url":"direct listing URL",'
     '"asking_price":null or number,'
     '"annual_revenue":null or number,'
-    '"revenue_notes":"any revenue context if not a clean number",'
+    '"revenue_notes":"any revenue context",'
     '"location":"state or region",'
-    '"description":"2 sentence business summary",'
+    '"description":"2 sentence summary",'
     '"highlights":"key selling points",'
-    '"broker_contact":"broker name and contact info if available",'
+    '"broker_contact":"broker name and contact if available",'
     '"status":"Active or Under LOI"'
-    '}]. If none found return []'
+    '}]. If none found: []'
 )
 
 SEARCH_BATCHES = [
     {
         "label": "BizBuySell — tax resolution",
-        "prompt": f"Search bizbuysell.com for ACTIVE tax resolution and tax settlement businesses currently for sale (not sold). Search 'site:bizbuysell.com tax resolution for sale' and 'site:bizbuysell.com tax settlement business'. Fetch the result pages and extract each listing's direct URL, title, price, revenue, location, and broker. {J}"
+        "prompt": f"Search bizbuysell.com for active tax resolution and tax settlement businesses for sale. Search 'site:bizbuysell.com tax resolution for sale' and 'site:bizbuysell.com tax settlement business'. Fetch result pages. Extract listing title, direct URL, price, revenue, location, broker for each. {J}"
     },
     {
-        "label": "BizBuySell — IRS and tax relief variants",
-        "prompt": f"Search bizbuysell.com for ACTIVE IRS resolution and tax relief businesses for sale (not sold). Search 'site:bizbuysell.com IRS resolution', 'site:bizbuysell.com tax relief company for sale', 'site:bizbuysell.com offer in compromise'. Fetch pages and extract each listing's direct URL, title, price, revenue, location, broker. {J}"
+        "label": "BizBuySell — IRS and tax relief",
+        "prompt": f"Search bizbuysell.com for active IRS resolution and tax relief businesses for sale. Search 'site:bizbuysell.com IRS resolution' and 'site:bizbuysell.com tax relief company for sale' and 'site:bizbuysell.com offer in compromise'. Fetch pages. Extract listing title, direct URL, price, revenue, location, broker. {J}"
     },
     {
         "label": "BizQuest + BusinessBroker.net",
-        "prompt": f"Search BizQuest.com and BusinessBroker.net for ACTIVE tax resolution and tax settlement businesses for sale. Search 'site:bizquest.com tax resolution', 'site:businessbroker.net tax resolution', 'site:bizquest.com tax settlement'. Fetch result pages and get each listing's direct URL, title, price, revenue, location, broker. {J}"
+        "prompt": f"Search BizQuest.com and BusinessBroker.net for active tax resolution businesses for sale. Search 'site:bizquest.com tax resolution', 'site:businessbroker.net tax resolution', 'site:bizquest.com tax settlement'. Fetch result pages. Extract title, direct URL, price, revenue, location, broker. {J}"
     },
     {
         "label": "Synergy + Sunbelt + Murphy brokers",
-        "prompt": f"Search broker sites for ACTIVE tax resolution business listings. Fetch https://synergybb.com/listings/ and search 'site:synergybb.com tax resolution'. Search 'site:sunbeltnetwork.com tax resolution OR tax settlement' and 'site:murphybusiness.com tax resolution'. Get each listing's direct URL, title, price, revenue, location, broker contact. {J}"
+        "prompt": f"Find active tax resolution business listings on broker sites. Fetch https://synergybb.com/listings/ and search 'site:synergybb.com tax resolution'. Search 'site:sunbeltnetwork.com tax resolution' and 'site:murphybusiness.com tax resolution'. Extract title, direct URL, price, revenue, location, broker contact. {J}"
     },
     {
         "label": "Axial + DealStream + MergerNetwork",
-        "prompt": f"Search M&A platforms for ACTIVE tax resolution company acquisition opportunities. Search 'site:axial.net tax resolution', 'site:dealstream.com tax resolution', 'site:mergernetwork.com tax resolution', 'axial.net tax settlement company for sale lower middle market'. Get each listing's direct URL, title, revenue, location. {J}"
+        "prompt": f"Search M&A platforms for active tax resolution acquisition opportunities. Search 'site:axial.net tax resolution', 'site:dealstream.com tax resolution', 'site:mergernetwork.com tax resolution'. Extract title, direct URL, revenue, location. {J}"
     },
     {
         "label": "IBBA + broker association listings",
-        "prompt": f"Search broker association databases for ACTIVE tax resolution practices for sale. Search 'IBBA member broker tax resolution business for sale 2025', 'certified business broker tax resolution company for sale 2025', 'tax resolution practice confidential listing broker', 'site:ibba.org tax resolution'. Get direct URLs, titles, prices, broker contacts. {J}"
+        "prompt": f"Search for active tax resolution practices listed through broker associations. Search 'IBBA broker tax resolution business for sale 2025', 'certified business broker tax resolution for sale 2025', 'tax resolution practice confidential listing 2025'. Extract title, direct URL, price, revenue, broker contact. {J}"
     },
     {
         "label": "Tax professional associations",
-        "prompt": f"Search tax professional associations for ACTIVE practices for sale. Search 'enrolled agent tax resolution practice for sale 2025', 'site:naea.org practice for sale', 'ASTPS tax resolution practice sale', 'NATP tax resolution practice for sale', 'tax resolution enrolled agent practice transition 2025'. Get direct URLs, titles, revenue info, contact details. {J}"
+        "prompt": f"Search for active tax resolution practices for sale via professional associations. Search 'enrolled agent tax resolution practice for sale 2025', 'NAEA practice for sale tax resolution', 'ASTPS tax resolution practice sale 2025', 'tax resolution practice transition 2025'. Extract title, direct URL, revenue, contact. {J}"
     },
     {
-        "label": "LinkedIn and off-market opportunities",
-        "prompt": f"Search for ACTIVE off-market tax resolution business sale opportunities. Search 'site:linkedin.com tax resolution company for sale 2025', 'seeking acquirer tax resolution company 2025', 'exploring sale tax resolution firm 2025', 'tax resolution business exit opportunity', 'off-market tax settlement company acquisition'. Get direct URLs and contact info. {J}"
+        "label": "LinkedIn and off-market",
+        "prompt": f"Search for active off-market tax resolution business opportunities. Search 'site:linkedin.com tax resolution company for sale 2025', 'seeking acquirer tax resolution 2025', 'exploring strategic sale tax resolution firm', 'off-market tax settlement company acquisition 2025'. Extract title, URL, details, contact. {J}"
     },
     {
-        "label": "Long-tail IRS terminology search",
-        "prompt": f"Search for ACTIVE tax resolution businesses using IRS-specific terms. Search 'IRS debt resolution company for sale 2025', 'offer in compromise firm for sale', 'tax lien resolution business for sale', 'IRS Fresh Start program company for sale', 'tax controversy firm for sale', 'tax representation firm sale 2025'. Get direct listing URLs, prices, revenue, contacts. {J}"
+        "label": "IRS terminology variants",
+        "prompt": f"Search for active tax resolution businesses using IRS-specific terms. Search 'IRS debt resolution company for sale 2025', 'offer in compromise business for sale', 'tax lien resolution firm for sale', 'tax controversy firm acquisition 2025', 'wage garnishment relief company sale'. Extract title, direct URL, price, revenue, location. {J}"
     },
     {
-        "label": "Named brands — exploring sale",
-        "prompt": f"Search for news or listings suggesting well-known tax resolution brands may be for sale. Search 'Optima Tax Relief acquisition OR for sale', 'Community Tax LLC acquisition', 'Tax Defense Network sale', 'Anthem Tax Services for sale', 'Larson Tax Relief acquisition', 'tax resolution company sale 2025 private equity'. Get direct URLs and any deal details. {J}"
+        "label": "Named brands",
+        "prompt": f"Search for news or listings about known tax resolution brands for sale. Search 'Optima Tax Relief acquisition 2025', 'Community Tax acquisition', 'Tax Defense Network for sale', 'Anthem Tax Services acquisition', 'tax resolution company private equity deal 2025'. Extract title, direct URL, deal details. {J}"
     },
     {
         "label": "Acquire.com + ExitAdviser + BizBen",
-        "prompt": f"Search smaller marketplaces for ACTIVE tax resolution listings. Search 'site:acquire.com tax resolution', 'site:exitadviser.com tax resolution', 'site:bizben.com tax resolution', 'site:businessesforsale.com tax resolution OR tax settlement'. Fetch result pages and get each listing's direct URL, title, price, revenue, location. {J}"
+        "prompt": f"Search smaller marketplaces for active tax resolution listings. Search 'site:acquire.com tax resolution', 'site:exitadviser.com tax resolution', 'site:bizben.com tax resolution', 'site:businessesforsale.com tax resolution'. Fetch result pages. Extract title, direct URL, price, revenue, location. {J}"
     },
     {
-        "label": "Private equity and M&A advisor sourcing",
-        "prompt": f"Search for tax resolution companies being actively marketed for sale by M&A advisors. Search 'tax resolution company confidential information memorandum 2025', 'tax settlement firm investment banker for sale', 'tax resolution company EBITDA for sale private equity', 'lower middle market tax resolution acquisition 2025'. Get direct URLs and deal details. {J}"
+        "label": "M&A advisor and PE sourcing",
+        "prompt": f"Search for tax resolution companies being marketed by M&A advisors or investment bankers. Search 'tax resolution company confidential information memorandum 2025', 'tax settlement firm for sale investment banker', 'tax resolution EBITDA acquisition private equity 2025'. Extract title, direct URL, revenue, deal details. {J}"
     },
     {
-        "label": "Broad catch-all sweep",
-        "prompt": f"Search broadly for any ACTIVE tax resolution or settlement businesses for sale not found by other searches. Search 'tax resolution company for sale 2025', 'tax settlement business acquisition opportunity', 'IRS resolution firm for sale', 'tax relief company revenue for sale United States 2025'. Fetch promising pages and extract listing details including direct URLs. {J}"
+        "label": "Broad catch-all",
+        "prompt": f"Search broadly for any active tax resolution or settlement businesses for sale in the US. Search 'tax resolution company for sale United States 2025', 'tax settlement business acquisition 2025', 'IRS resolution firm for sale revenue', 'tax relief company for sale $5 million 2025'. Fetch promising pages. Extract title, direct URL, price, revenue, location, broker. {J}"
     },
 ]
 
@@ -100,24 +100,10 @@ SEARCH_BATCHES = [
 
 def run_single_search(client, label, prompt):
     print(f"  [{label}]...")
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=2000,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}]
-        )
-        full_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                full_text += block.text
-        return full_text
-    except anthropic.RateLimitError:
-        print(f"    Rate limit hit — waiting 90s then retrying...")
-        time.sleep(90)
+    for attempt in range(2):
         try:
             response = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2000,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
@@ -126,29 +112,45 @@ def run_single_search(client, label, prompt):
             for block in response.content:
                 if hasattr(block, "text"):
                     full_text += block.text
+            # Debug: print first 300 chars of response
+            preview = full_text.strip()[:300].replace("\n", " ")
+            print(f"    Response preview: {preview}")
             return full_text
-        except Exception as e2:
-            print(f"    Retry failed: {e2}")
+        except anthropic.RateLimitError as e:
+            wait = 120 if attempt == 0 else 0
+            if wait:
+                print(f"    Rate limit — waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"    Rate limit on retry — skipping")
+                return "[]"
+        except Exception as e:
+            print(f"    Error: {e}")
             return "[]"
-    except Exception as e:
-        print(f"    Error: {e}")
-        return "[]"
+    return "[]"
 
 def parse_listings(raw_text, label):
-    text  = raw_text.strip()
-    start = text.find("[")
-    end   = text.rfind("]") + 1
-    if start == -1 or end == 0:
-        print(f"    No JSON found")
+    text = raw_text.strip()
+
+    # Try to find JSON array anywhere in the response
+    match = re.search(r'\[.*\]', text, re.DOTALL)
+    if not match:
+        print(f"    No JSON array found in response")
         return []
+
     try:
-        listings = json.loads(text[start:end])
-        # Filter to active only as a safety net
-        active = [l for l in listings if l.get("status", "").lower() in ("active", "under loi", "under loi")]
-        print(f"    Found {len(active)} active listing(s) (of {len(listings)} total)")
+        listings = json.loads(match.group())
+        # Filter active only
+        active = [
+            l for l in listings
+            if isinstance(l, dict) and
+            l.get("status", "active").lower().replace(" ", "") in ("active", "underloi")
+        ]
+        print(f"    Parsed {len(active)} active listing(s) of {len(listings)} total")
         return active
-    except json.JSONDecodeError:
-        print(f"    JSON parse error")
+    except json.JSONDecodeError as e:
+        print(f"    JSON parse error: {e}")
+        print(f"    Raw snippet: {match.group()[:200]}")
         return []
 
 # ── Google Sheets ────────────────────────────────────────────────────────────
@@ -171,7 +173,7 @@ HEADERS = [
     "Highlights",
     "Broker / Contact",
     "Status",
-    "Listing ID",        # hidden dedup key — keep last so partner ignores it
+    "Listing ID",
 ]
 
 def get_sheet():
@@ -244,7 +246,7 @@ def append_new_listings(ws, all_listings):
 
 def main():
     print(f"=== Tax Resolution Scraper — {datetime.utcnow().date()} ===")
-    print(f"Running {len(SEARCH_BATCHES)} batches with 70s pause between each...\n")
+    print(f"Model: claude-haiku-4-5-20251001 | Batches: {len(SEARCH_BATCHES)} | Pause: 90s\n")
 
     client       = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     all_listings = []
@@ -255,11 +257,10 @@ def main():
         listings = parse_listings(raw, batch["label"])
         all_listings.extend(listings)
         if i < len(SEARCH_BATCHES):
-            print(f"    Pausing 70s...")
-            time.sleep(70)
+            print(f"    Pausing 90s...")
+            time.sleep(90)
 
     print(f"\nTotal active listings found: {len(all_listings)}")
-
     ws  = get_sheet()
     new = append_new_listings(ws, all_listings)
     print(f"=== Done. {new} new listing(s) added today. ===")
